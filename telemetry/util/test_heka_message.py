@@ -64,7 +64,7 @@ class TestHekaMessage(unittest.TestCase):
         w = hm.BacktrackableFile(StringIO("FOOBAR\x1eFOOBAR"))
         self.assertEquals("FOOBAR\x1eFOO", w.read(10))
         w.backtrack()
-        self.assertEquals("\x1eFOOBAR", w.read(10))
+        self.assertEquals("FOOBAR", w.read(10))
 
     def test_backtracking_without_separator(self):
         # Test backtracking when separator wasn't read
