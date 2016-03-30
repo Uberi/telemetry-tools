@@ -15,18 +15,42 @@ from cStringIO import StringIO
 from google.protobuf.message import DecodeError
 
 
-_record_separator = 0x1e
+RECORD_SEPARATOR = 0x1e
 
 
 class BacktrackableFile:
+    """
+    Wrapper for file-like objects that exposes a file-like object interface,
+    but also allows backtracking to the first byte in the file-like object
+    equal to `RECORD_SEPARATOR` that we haven't backtracked to yet.
+
+    This is useful for parsing Heka records, since backtracking will always move us
+    back to the start of a possible Heka record.
+
+    See http://hekad.readthedocs.org/en/latest/message/ for Heka message details.
+    """
     def __init__(self, stream):
         self._stream = stream
         self._buffer = StringIO()
+        self._position = 0
+
+    def tell(self):
+        """
+        Returns the virtual position within this file-like object;
+        the effective offset from the beginning of the wrapped file-like object.
+        """
+        return self._position
 
     def read(self, size):
+        """
+        Read and return `size` bytes. Might not actually read the wrapped
+        file-like object if there are enough bytes buffered.
+        """
+        self._position += size
         buffer_data = self._buffer.read(size)
         to_read = size - len(buffer_data)
 
+        assert to_read >= 0, "Read data must be equal or smaller to requested data"
         if to_read == 0:
             return buffer_data
 
@@ -36,6 +60,7 @@ class BacktrackableFile:
         return buffer_data + stream_data
 
     def close(self):
+        """Close the file-like object, as well as its wrapped file-like object."""
         self._buffer.close()
         if type(self._stream) == boto.s3.key.Key:
             if self._stream.resp:  # Hack! Connections are kept around otherwise!
@@ -46,16 +71,31 @@ class BacktrackableFile:
             self._stream.close()
 
     def backtrack(self):
+        """
+        Move the file cursor back to just after the first `RECORD_SEPARATOR` byte
+        in the stream that we haven't already backtracked to.
+        """
         buffer = self._buffer.getvalue()
-        index = buffer.find(chr(_record_separator), 1)
 
+        # start searching after the first byte, since the first byte would often be a record separator,
+        # and we don't want to backtrack to the same place every time
+        index = buffer.find(chr(RECORD_SEPARATOR), 1)
+
+        # update the position to account for moving backward in the stream
+        self._position += index + 1 - len(buffer)
+
+        # reset the buffer, since we'll never want to backtrack before this point ever again
+        # basically we're going to discard everything before this backtracking operation
         self._buffer = StringIO()
         if index >= 0:
-            self._buffer.write(buffer[index:])
+            # we add 1 because we want to have the same behaviour as `read_until_next`,
+            # which will set the cursor to just after the record separator
+            self._buffer.write(buffer[index + 1:])
             self._buffer.seek(0)
 
 
 class UnpackedRecord():
+    """Represents a single Heka message. See http://hekad.readthedocs.org/en/latest/message/ for details."""
     def __init__(self, raw, header, message=None, error=None):
         self.raw = raw
         self.header = header
@@ -64,7 +104,16 @@ class UnpackedRecord():
 
 
 # Returns (bytes_skipped=int, eof_reached=bool)
-def read_until_next(fin, separator=_record_separator):
+def read_until_next(fin, separator=RECORD_SEPARATOR):
+    """
+    Read bytes in a file-like object until `separator` is found.
+
+    Returns the number of bytes skipped, and whether the search failed to find `separator`. If `separator` is found,
+    the number of bytes skipped is one less than the actual number of bytes successfully read. Otherwise, they are the same.
+
+    Note that when this completes, the file cursor will be immediately after the `separator` byte,
+    so the next byte read will be the one after it.
+    """
     bytes_skipped = 0
     while True:
         c = fin.read(1)
@@ -80,9 +129,22 @@ def read_until_next(fin, separator=_record_separator):
 # Stream Framing:
 #  https://hekad.readthedocs.org/en/latest/message/index.html
 def read_one_record(input_stream, raw=False, verbose=False, strict=False, try_snappy=True):
+    """
+    Attempt to read one Heka record from the file-like object `input_stream`, returning an `UnpackedRecord` instance.
+
+    Returns the record (or `None` if the stream ended while reading), and the total number of bytes read.
+
+    If and only if `raw` is set, messages won't be parsed (the `UnpackedRecord` instance still contains the raw record, however).
+
+    If and only if `verbose` is set, useful debugging information will be printed while parsing.
+
+    If and only if `strict` is set, the stream is validated more thoroughly.
+
+    If and only if `try_snappy` is set, the function will also attempt to decompress the message body with Snappy.
+    """
     # Read 1 byte record separator (and keep reading until we get one)
     total_bytes = 0
-    skipped, eof = read_until_next(input_stream, 0x1e)
+    skipped, eof = read_until_next(input_stream, RECORD_SEPARATOR)
     total_bytes += skipped
     if eof:
         return None, total_bytes
@@ -96,11 +158,12 @@ def read_one_record(input_stream, raw=False, verbose=False, strict=False, try_sn
         if verbose:
             print "Skipped", skipped, "bytes to find a valid separator"
 
+    #print "position", input_stream.tell()
     raw_record = struct.pack("<B", 0x1e)
 
     # Read the header length
     header_length_raw = input_stream.read(1)
-    if header_length_raw == '':
+    if header_length_raw == '': # no more data to read
         return None, total_bytes
 
     total_bytes += 1
@@ -112,7 +175,7 @@ def read_one_record(input_stream, raw=False, verbose=False, strict=False, try_sn
     (header_length,) = struct.unpack('<B', header_length_raw)
 
     header_raw = input_stream.read(header_length)
-    if header_raw == '':
+    if header_length > 0 and header_raw == '': # no more data to read
         return None, total_bytes
     total_bytes += header_length
     raw_record += header_raw
@@ -122,12 +185,7 @@ def read_one_record(input_stream, raw=False, verbose=False, strict=False, try_sn
     unit_separator = input_stream.read(1)
     total_bytes += 1
     if ord(unit_separator[0]) != 0x1f:
-        error_msg = "Unexpected unit separator character in record #{} " \
-                "at offset {}: {}".format(record_count, total_bytes,
-                ord(unit_separator[0]))
-        if strict:
-            raise ValueError(error_msg)
-        return UnpackedRecord(raw_record, header, error=error_msg), total_bytes
+        raise DecodeError("Unexpected unit separator character in record at offset {}: {}".format(total_bytes, ord(unit_separator[0])))
     raw_record += unit_separator
 
     #print "message length:", header.message_length
@@ -169,6 +227,13 @@ def unpack_string(string, **kwargs):
 
 
 def unpack(fin, raw=False, verbose=False, strict=False, backtrack=False, try_snappy=True):
+    """
+    Attempt to parse a sequence of records in a file-like object.
+
+    Returns an iterator, which yields tuples of `UnpackedRecord` and the total number of bytes read so far.
+
+    The flags are the same as those for `read_one_record`.
+    """
     record_count = 0
     bad_records = 0
     total_bytes = 0
@@ -184,7 +249,9 @@ def unpack(fin, raw=False, verbose=False, strict=False, backtrack=False, try_sna
             elif verbose:
                 print e
 
-            if backtrack and type(e) == DecodeError:
+            # if we can backtrack and the message wasn't well formed,
+            # backtrack and try to parse the message starting from there
+            if backtrack and type(e) in {DecodeError, UnicodeDecodeError}: # these are the exceptions that protobuf will throw
                 fin.backtrack()
                 continue
 
