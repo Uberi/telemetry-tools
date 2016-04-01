@@ -165,7 +165,6 @@ def read_one_record(input_stream, raw=False, verbose=False, strict=False, try_sn
         if verbose:
             print "Skipped", skipped, "bytes to find a valid separator"
 
-    #print "position", input_stream.tell()
     raw_record = struct.pack("<B", 0x1e)
 
     # Read the header length
@@ -195,7 +194,6 @@ def read_one_record(input_stream, raw=False, verbose=False, strict=False, try_sn
         raise DecodeError("Unexpected unit separator character in record at offset {}: {}".format(total_bytes, ord(unit_separator[0])))
     raw_record += unit_separator
 
-    #print "message length:", header.message_length
     message_raw = input_stream.read(header.message_length)
 
     total_bytes += header.message_length

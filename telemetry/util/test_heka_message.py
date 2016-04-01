@@ -6,8 +6,7 @@ import os
 import shutil
 import unittest
 import json
-#import telemetry.util.heka_message as hm
-import heka_message as hm
+import telemetry.util.heka_message as hm
 
 from cStringIO import StringIO
 
