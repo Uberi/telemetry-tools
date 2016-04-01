@@ -21,8 +21,8 @@ RECORD_SEPARATOR = 0x1e
 class BacktrackableFile:
     """
     Wrapper for file-like objects that exposes a file-like object interface,
-    but also allows backtracking to the first byte in the file-like object
-    equal to `RECORD_SEPARATOR` that we haven't backtracked to yet.
+    but also allows backtracking to just after the first byte in the file-like
+    object equal to `RECORD_SEPARATOR` that we haven't backtracked to yet.
 
     This is useful for parsing Heka records, since backtracking will always move us
     back to the start of a possible Heka record.
@@ -46,7 +46,6 @@ class BacktrackableFile:
         Read and return `size` bytes. Might not actually read the wrapped
         file-like object if there are enough bytes buffered.
         """
-        self._position += size
         buffer_data = self._buffer.read(size)
         to_read = size - len(buffer_data)
 
@@ -56,8 +55,10 @@ class BacktrackableFile:
 
         stream_data = self._stream.read(to_read)
         self._buffer.write(stream_data)
+        result = buffer_data + stream_data
+        self._position += len(result)
 
-        return buffer_data + stream_data
+        return result
 
     def close(self):
         """Close the file-like object, as well as its wrapped file-like object."""
@@ -73,13 +74,19 @@ class BacktrackableFile:
     def backtrack(self):
         """
         Move the file cursor back to just after the first `RECORD_SEPARATOR` byte
-        in the stream that we haven't already backtracked to.
+        in the stream that we haven't already backtracked to. If none, 
         """
         buffer = self._buffer.getvalue()
 
         # start searching after the first byte, since the first byte would often be a record separator,
         # and we don't want to backtrack to the same place every time
         index = buffer.find(chr(RECORD_SEPARATOR), 1)
+        if index == -1:
+            # no record separator found, but we don't want to potentially backtrack to our original place,
+            # which would cause an infinite loop if the last record is malformed;
+            # we'll just not do anything instead
+            self._buffer = StringIO()
+            return
 
         # update the position to account for moving backward in the stream
         self._position += index + 1 - len(buffer)
@@ -87,11 +94,11 @@ class BacktrackableFile:
         # reset the buffer, since we'll never want to backtrack before this point ever again
         # basically we're going to discard everything before this backtracking operation
         self._buffer = StringIO()
-        if index >= 0:
-            # we add 1 because we want to have the same behaviour as `read_until_next`,
-            # which will set the cursor to just after the record separator
-            self._buffer.write(buffer[index + 1:])
-            self._buffer.seek(0)
+
+        # we add 1 because we want to have the same behaviour as `read_until_next`,
+        # which will set the cursor to just after the record separator
+        self._buffer.write(buffer[index + 1:])
+        self._buffer.seek(0)
 
 
 class UnpackedRecord():
